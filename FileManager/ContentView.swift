@@ -13,6 +13,16 @@ struct ContentView: View {
     @State private var alertMessage: String = ""
     @State private var isDragOver: Bool = false
     @State private var isLoading: Bool = false
+    @State private var isBulkMode: Bool = false
+    @State private var bulkDateOption: BulkDateOption = .modificationEqualsCreation
+    @State private var selectedFiles: [URL] = []
+    @State private var bulkProgress: Double = 0.0
+    @State private var isProcessingBulk: Bool = false
+
+    enum BulkDateOption: String, CaseIterable {
+        case modificationEqualsCreation = "Bearbeitungszeit = Erstellungszeit"
+        case creationEqualsModification = "Erstellungszeit = Bearbeitungszeit"
+    }
     
     private let fileValidator = FileValidator()
     private let fileManagerHelper = FileManagerHelper()
@@ -131,6 +141,76 @@ struct ContentView: View {
     
     // MARK: - Editing Controls
     private var editingControls: some View {
+        VStack(spacing: 16) {
+            // Bulk Mode Toggle
+            HStack {
+                Toggle("Bulk Changes", isOn: $isBulkMode)
+                    .font(.headline)
+                Spacer()
+            }
+            
+            if isBulkMode {
+                bulkModeControls
+            } else {
+                singleFileControls
+            }
+        }
+    }
+
+    private var bulkModeControls: some View {
+        VStack(spacing: 16) {
+            GroupBox("Bulk-Modus") {
+                VStack(spacing: 12) {
+                    HStack {
+                        Text("Datum-Option:")
+                            .frame(width: 120, alignment: .leading)
+                        Picker("", selection: $bulkDateOption) {
+                            ForEach(BulkDateOption.allCases, id: \.self) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        Spacer()
+                    }
+                    
+                    if !selectedFiles.isEmpty {
+                        HStack {
+                            Text("Dateien:")
+                                .frame(width: 120, alignment: .leading)
+                            Text("\(selectedFiles.count) Dateien ausgewählt")
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                    }
+                    
+                    if isProcessingBulk {
+                        VStack {
+                            ProgressView("Verarbeite Dateien...", value: bulkProgress, total: 1.0)
+                            Text("\(Int(bulkProgress * 100))% abgeschlossen")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding()
+            }
+            
+            HStack(spacing: 12) {
+                Button("Dateien wählen") {
+                    selectMultipleFiles()
+                }
+                .disabled(isProcessingBulk)
+                
+                Button("Alle verarbeiten") {
+                    processBulkFiles()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedFiles.isEmpty || isProcessingBulk)
+            }
+        }
+    }
+
+    private var singleFileControls: some View {
         VStack(spacing: 16) {
             GroupBox("Datei bearbeiten") {
                 VStack(spacing: 16) {
@@ -269,17 +349,21 @@ struct ContentView: View {
     }
     
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
-            DispatchQueue.main.async {
-                if let data = item as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    loadFile(url: url)
+        if isBulkMode {
+            return handleBulkDrop(providers: providers)
+        } else {
+            guard let provider = providers.first else { return false }
+            
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                DispatchQueue.main.async {
+                    if let data = item as? Data,
+                       let url = URL(dataRepresentation: data, relativeTo: nil) {
+                        loadFile(url: url)
+                    }
                 }
             }
+            return true
         }
-        return true
     }
     
     private func loadFile(url: URL) {
@@ -353,6 +437,98 @@ struct ContentView: View {
                     isLoading = false
                     showAlert("Fehler beim Speichern: \(error.localizedDescription)")
                 }
+            }
+        }
+    }
+    
+    private func selectMultipleFiles() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        
+        if panel.runModal() == .OK {
+            selectedFiles = panel.urls
+        }
+    }
+
+    private func handleBulkDrop(providers: [NSItemProvider]) -> Bool {
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+                if let data = item as? Data,
+                   let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    urls.append(url)
+                }
+                group.leave()
+            }
+        }
+        
+        group.notify(queue: .main) {
+            self.selectedFiles = urls
+            if !urls.isEmpty {
+                self.processBulkFiles()
+            }
+        }
+        
+        return true
+    }
+
+    private func processBulkFiles() {
+        guard !selectedFiles.isEmpty else { return }
+        
+        isProcessingBulk = true
+        bulkProgress = 0.0
+        
+        Task {
+            let totalFiles = selectedFiles.count
+            
+            for (index, fileURL) in selectedFiles.enumerated() {
+                do {
+                    // Get current file attributes
+                    let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                    let currentCreation = attributes[.creationDate] as? Date ?? Date()
+                    let currentModification = attributes[.modificationDate] as? Date ?? Date()
+                    
+                    // Determine new dates based on selected option
+                    let (newCreation, newModification): (Date, Date)
+                    switch bulkDateOption {
+                    case .modificationEqualsCreation:
+                        newCreation = currentCreation
+                        newModification = currentCreation
+                    case .creationEqualsModification:
+                        newCreation = currentModification
+                        newModification = currentModification
+                    }
+                    
+                    // Update file metadata (keep original name)
+                    let fileName = fileURL.deletingPathExtension().lastPathComponent
+                    _ = try await fileManagerHelper.updateFileMetadata(
+                        file: fileURL,
+                        newName: fileName,
+                        newCreationDate: newCreation,
+                        newModificationDate: newModification
+                    )
+                    
+                    await MainActor.run {
+                        bulkProgress = Double(index + 1) / Double(totalFiles)
+                    }
+                    
+                } catch {
+                    await MainActor.run {
+                        showAlert("Fehler bei Datei \(fileURL.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+            }
+            
+            await MainActor.run {
+                isProcessingBulk = false
+                selectedFiles.removeAll()
+                bulkProgress = 0.0
+                showAlert("Bulk-Verarbeitung abgeschlossen! \(totalFiles) Dateien wurden bearbeitet.")
             }
         }
     }
